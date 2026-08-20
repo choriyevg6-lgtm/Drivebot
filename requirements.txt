@@ -1,3 +1,6 @@
 pyTelegramBotAPI
 Pillow
 flask
+requests
+fpdf2
+openpyxl
