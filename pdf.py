@@ -2,6 +2,7 @@ import os
 import time
 import logging
 import zipfile
+import threading
 import urllib.request
 from io import BytesIO
 from xml.etree import ElementTree
@@ -10,10 +11,41 @@ import telebot
 from telebot import types, apihelper
 
 from PIL import Image, ImageDraw, ImageFont
+from flask import Flask
 
 # Katta fayllarni yuborishda ulanish uzilib qolmasligi uchun timeout'larni oshiramiz
 apihelper.CONNECT_TIMEOUT = 30
 apihelper.READ_TIMEOUT = 180
+
+# ============================================================
+# RENDER "WEB SERVICE" TALABI: portni band qilib turadigan mini-server
+# (Render buni ko'rmasa, konteynerni uxlatib/qayta ishga tushirib turadi)
+# ============================================================
+keep_alive_app = Flask(__name__)
+
+
+@keep_alive_app.route("/")
+def _health():
+    return "Bot ishlayapti"
+
+
+def run_keep_alive_server():
+    port = int(os.environ.get("PORT", 10000))
+    keep_alive_app.run(host="0.0.0.0", port=port)
+
+
+def self_ping_loop():
+    """Render bepul tarifda uzoq harakatsizlikdan uxlab qolmasligi uchun o'zini chaqirib turadi."""
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        logger.info("[keep-alive] RENDER_EXTERNAL_URL topilmadi, self-ping o'chirilgan (lokalda bu normal).")
+        return
+    while True:
+        try:
+            urllib.request.urlopen(url, timeout=15)
+        except Exception as e:
+            logger.warning(f"[keep-alive] self-ping xato: {e}")
+        time.sleep(600)  # 10 daqiqada bir marta
 
 # ============================================================
 # SOZLAMALAR
@@ -445,5 +477,9 @@ if __name__ == "__main__":
     os.makedirs(FONTS_DIR, exist_ok=True)
     os.makedirs(TEMPLATES_DIR, exist_ok=True)
     ensure_fonts()
+
+    threading.Thread(target=run_keep_alive_server, daemon=True).start()
+    threading.Thread(target=self_ping_loop, daemon=True).start()
+
     logger.info("Bot ishga tushdi...")
     bot.infinity_polling()
