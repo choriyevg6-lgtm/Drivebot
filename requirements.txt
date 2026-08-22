@@ -5,3 +5,4 @@ requests
 fpdf2
 openpyxl
 PyMuPDF
+pytesseract
