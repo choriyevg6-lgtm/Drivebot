@@ -22,4 +22,4 @@ COPY . .
 # Render bu portni beradi (PORT env orqali); shu yerda 10000 - standart
 EXPOSE 10000
 
-CMD ["python3", "bot_telebot.py"]
+CMD ["python3", "pdf.py"]
