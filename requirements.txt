@@ -7,3 +7,4 @@ openpyxl
 PyMuPDF
 pytesseract
 python-docx
+pdf2docx
