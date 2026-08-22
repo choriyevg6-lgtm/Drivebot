@@ -2,10 +2,13 @@ import os
 import re
 import time
 import queue
+import shutil
 import logging
 import zipfile
 import sqlite3
+import pathlib
 import threading
+import subprocess
 import urllib.request
 from io import BytesIO
 from datetime import datetime
@@ -17,6 +20,10 @@ from telebot import types, apihelper
 from PIL import Image, ImageDraw, ImageFont
 from fpdf import FPDF
 from openpyxl import load_workbook
+import fitz  # PyMuPDF
+import pytesseract
+from docx import Document as DocxDocument
+from pdf2docx import Converter as Pdf2DocxConverter
 
 # Katta fayllarni yuborishda ulanish uzilib qolmasligi uchun timeout'larni oshiramiz
 apihelper.CONNECT_TIMEOUT = 30
@@ -296,6 +303,37 @@ FONTS = {
         "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/comforter/Comforter-Regular.ttf",
         "joined": True,
     },
+    # --- Yangi qo'shilgan 6 ta shrift (3 ulangan + 3 oddiy uslub) ---
+    "Comforter Brush": {
+        "file": "ComforterBrush.ttf",
+        "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/comforterbrush/ComforterBrush-Regular.ttf",
+        "joined": True,
+    },
+    "Pattaya": {
+        "file": "Pattaya.ttf",
+        "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/pattaya/Pattaya-Regular.ttf",
+        "joined": True,
+    },
+    "Neucha": {
+        "file": "Neucha.ttf",
+        "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/neucha/Neucha.ttf",
+        "joined": True,
+    },
+    "Underdog": {
+        "file": "Underdog.ttf",
+        "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/underdog/Underdog-Regular.ttf",
+        "joined": False,
+    },
+    "Amatic SC": {
+        "file": "AmaticSC.ttf",
+        "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/amaticsc/AmaticSC-Regular.ttf",
+        "joined": False,
+    },
+    "Yeseva One": {
+        "file": "YesevaOne.ttf",
+        "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/yesevaone/YesevaOne-Regular.ttf",
+        "joined": False,
+    },
 }
 
 # Oddiy (yozma bo'lmagan), Lotin+Kirill'ni qo'llab-quvvatlaydigan shrift —
@@ -335,6 +373,17 @@ def ensure_fonts():
 def send_with_retry(func, *args, attempts: int = 3, **kwargs):
     last_error = None
     for i in range(1, attempts + 1):
+        # MUHIM: agar avvalgi urinish tarmoq xatosi bilan yarim yo'lda uzilib
+        # qolgan bo'lsa, BytesIO/fayl ko'rsatkichi oxiriga surilib qolishi
+        # mumkin. Qayta urinishdan oldin uni har doim boshiga qaytaramiz,
+        # aks holda bot "bo'sh fayl" (file must be non-empty) xatosiga uchraydi.
+        for value in list(args) + list(kwargs.values()):
+            seek = getattr(value, "seek", None)
+            if callable(seek):
+                try:
+                    seek(0)
+                except Exception:
+                    pass
         try:
             return func(*args, **kwargs)
         except Exception as e:
@@ -387,8 +436,17 @@ def read_pptx_text(path: str) -> str:
         names.sort(key=slide_num)
         for idx, name in enumerate(names, start=1):
             root = ElementTree.fromstring(z.read(name))
-            texts = [node.text or "" for node in root.iter(f"{{{ns_a}}}t")]
-            body = "\n".join(t for t in texts if t.strip())
+            paragraph_lines = []
+            # PowerPoint bitta gapni imlo tekshiruvi/formatlash tufayli bir nechta
+            # <a:r> (run) bo'lakchalarga bo'lib qo'yadi — shuning uchun har bir
+            # <a:p> (paragraf) ICHIDAGI barcha matn bo'lakchalarini BO'SHLIQSIZ
+            # birlashtiramiz, faqat paragraflar orasida yangi qator qo'yamiz.
+            for p in root.iter(f"{{{ns_a}}}p"):
+                runs = [node.text or "" for node in p.iter(f"{{{ns_a}}}t")]
+                line = "".join(runs).strip()
+                if line:
+                    paragraph_lines.append(line)
+            body = "\n".join(paragraph_lines)
             slides.append(f"--- {idx}-slayd ---\n{body}" if body else f"--- {idx}-slayd ---")
     return "\n\n".join(slides)
 
@@ -596,7 +654,7 @@ def get_settings(user_id: int) -> dict:
 # ============================================================
 MAIN_MENU_ROW1 = ["🖋 Shrift tanlash", "📄 Qog'oz turi"]
 MAIN_MENU_ROW2 = ["🖼 Namuna", "📑 PDF qilish"]
-MAIN_MENU_ROW3 = ["ℹ️ Yordam"]
+MAIN_MENU_ROW3 = ["📄➜📝 PDF dan Word", "ℹ️ Yordam"]
 BACK_BUTTON = "⬅️ Orqaga"
 ADMIN_BUTTON = "🛠 Admin panel"
 
@@ -619,10 +677,9 @@ def main_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row(*MAIN_MENU_ROW1)
     markup.row(*MAIN_MENU_ROW2)
+    markup.row(*MAIN_MENU_ROW3)
     if is_admin(user_id):
-        markup.row(MAIN_MENU_ROW3[0], ADMIN_BUTTON)
-    else:
-        markup.row(*MAIN_MENU_ROW3)
+        markup.row(ADMIN_BUTTON)
     return markup
 
 
@@ -675,6 +732,8 @@ def admin_menu_keyboard() -> types.ReplyKeyboardMarkup:
 # YORDAMCHI: MAJBURIY OBUNANI TEKSHIRISH
 # ============================================================
 def blocked_by_subscription(message: types.Message) -> bool:
+    if is_admin(message.from_user.id):
+        return False
     missing = get_missing_subscriptions(message.from_user.id)
     if missing:
         send_subscription_prompt(message.chat.id, missing)
@@ -699,6 +758,8 @@ def cb_check_subs(call: types.CallbackQuery):
 def cmd_start(message: types.Message):
     get_or_create_user(message.from_user.id, message.from_user.username)
     get_settings(message.from_user.id)
+    if blocked_by_subscription(message):
+        return
     bot.send_message(
         message.chat.id,
         "👋 Salom! Men matningizni qo'lda yozilgandek qilib rasmga aylantiraman, "
@@ -713,11 +774,15 @@ def cmd_start(message: types.Message):
 # ============================================================
 @bot.message_handler(func=lambda m: m.text == "🖋 Shrift tanlash")
 def open_font_menu(message: types.Message):
+    if blocked_by_subscription(message):
+        return
     bot.send_message(message.chat.id, "Shriftni tanlang:", reply_markup=font_menu_keyboard())
 
 
 @bot.message_handler(func=lambda m: m.text in FONTS)
 def set_font(message: types.Message):
+    if blocked_by_subscription(message):
+        return
     get_settings(message.from_user.id)["font"] = message.text
     note = " (harflari bir-biriga ulangan)" if FONTS[message.text]["joined"] else ""
     bot.send_message(
@@ -729,11 +794,15 @@ def set_font(message: types.Message):
 
 @bot.message_handler(func=lambda m: m.text == "📄 Qog'oz turi")
 def open_paper_menu(message: types.Message):
+    if blocked_by_subscription(message):
+        return
     bot.send_message(message.chat.id, "Qog'oz turini tanlang:", reply_markup=paper_menu_keyboard())
 
 
 @bot.message_handler(func=lambda m: m.text in PAPER_LABEL_TO_KEY)
 def set_paper(message: types.Message):
+    if blocked_by_subscription(message):
+        return
     key = PAPER_LABEL_TO_KEY[message.text]
     get_settings(message.from_user.id)["paper"] = key
     bot.send_message(
@@ -745,13 +814,16 @@ def set_paper(message: types.Message):
 
 @bot.message_handler(func=lambda m: m.text == "ℹ️ Yordam")
 def help_menu(message: types.Message):
+    if blocked_by_subscription(message):
+        return
     bot.send_message(
         message.chat.id,
         "Menga matn yoki .docx fayl yuboring — men uni qo'lyozma ko'rinishidagi rasm/PDF ga aylantirib beraman.\n\n"
         "🖋 <b>Shrift tanlash</b> — yozuv uslubi\n"
         "📄 <b>Qog'oz turi</b> — Daftar yoki List\n"
         "🖼 <b>Namuna</b> — barcha shriftlarning ko'rinishi\n"
-        "📑 <b>PDF qilish</b> — Word/Excel/PPT yoki rasmlarni PDF ga aylantirish",
+        "📑 <b>PDF qilish</b> — Word/Excel/PPT yoki rasmlarni PDF ga aylantirish\n"
+        "📄➜📝 <b>PDF dan Word</b> — PDF faylni tahrirlanadigan Word'ga aylantirish",
         reply_markup=main_menu_keyboard(message.from_user.id),
     )
 
@@ -791,6 +863,24 @@ def go_back(message: types.Message):
 
 
 # ============================================================
+# PDF DAN WORD
+# ============================================================
+@bot.message_handler(func=lambda m: m.text == "📄➜📝 PDF dan Word")
+def open_pdf_to_word(message: types.Message):
+    if blocked_by_subscription(message):
+        return
+    settings = get_settings(message.from_user.id)
+    settings["mode"] = "awaiting_pdf_for_word"
+    bot.send_message(
+        message.chat.id,
+        "📄 Menga .pdf faylni yuboring — tahrirlanadigan Word (.docx) faylga aylantirib beraman.\n"
+        "Agar PDF oddiy (Word'dan yaratilgan) bo'lsa — aniq va tez ishlaydi. "
+        "Skanerlangan (rasm) PDF bo'lsa, OCR orqali o'qiladi.",
+        reply_markup=main_menu_keyboard(message.from_user.id),
+    )
+
+
+# ============================================================
 # PDF QILISH — Hujjatdan PDF (Word/Excel/PPT) / Rasmdan PDF
 # ============================================================
 @bot.message_handler(func=lambda m: m.text == "📑 PDF qilish")
@@ -802,17 +892,22 @@ def open_pdf_menu(message: types.Message):
 
 @bot.message_handler(func=lambda m: m.text == PDF_MENU_DOCX)
 def choose_docx_to_pdf(message: types.Message):
+    if blocked_by_subscription(message):
+        return
     settings = get_settings(message.from_user.id)
     settings["mode"] = "awaiting_document_for_pdf"
     bot.send_message(
         message.chat.id,
-        "📝 Menga .docx, .xlsx yoki .pptx faylni yuboring — men uni toza, matnli PDF ga aylantirib beraman.",
+        "📝 Menga .docx, .xlsx yoki .pptx faylni yuboring — men uni asl fayldagidek "
+        "(shrift, jadval, formatlash saqlangan holda) PDF ga aylantirib beraman.",
         reply_markup=pdf_menu_keyboard(),
     )
 
 
 @bot.message_handler(func=lambda m: m.text == PDF_MENU_IMAGES)
 def choose_images_to_pdf(message: types.Message):
+    if blocked_by_subscription(message):
+        return
     settings = get_settings(message.from_user.id)
     settings["mode"] = "collecting_images"
     settings["pending_images"] = []
@@ -882,44 +977,228 @@ def do_images_to_pdf(chat_id: int, images_bytes: list, filename: str):
         bot.send_message(chat_id, f"❌ Xatolik: {e}")
 
 
+def find_soffice_binary() -> str | None:
+    for candidate in ("soffice", "libreoffice"):
+        path = shutil.which(candidate)
+        if path:
+            return path
+    return None
+
+
+SOFFICE_BIN = find_soffice_binary()
+
+
+def convert_via_libreoffice(input_path: str, output_dir: str, timeout: int = 90) -> str | None:
+    """Word/Excel/PowerPoint faylni LibreOffice yordamida ASL ko'rinishidagi
+    (shrift, jadval, ustunlar, rasm — hammasi saqlangan holda) PDF ga aylantiradi.
+    Bu — Word'ning o'zi "Save as PDF" qilganidagi natijaga teng. Muvaffaqiyatsiz
+    bo'lsa None qaytaradi (chaqiruvchi kod matnli usulga o'tadi)."""
+    if not SOFFICE_BIN:
+        return None
+
+    # MUHIM: har bir chaqiruv uchun ALOHIDA, mustaqil profil papkasi beramiz.
+    # Aks holda ketma-ket konvertatsiyalarda (masalan avval .docx, keyin .xlsx)
+    # LibreOffice bir xil profilni "qulflab" qo'yadi va ikkinchi fayl jimgina
+    # konvertatsiya qilinmay qoladi (bot "soddalashtirilgan rejim"ga tushib ketadi).
+    profile_dir = os.path.join(output_dir, "lo_profile")
+    os.makedirs(profile_dir, exist_ok=True)
+    profile_uri = pathlib.Path(profile_dir).resolve().as_uri()
+
+    env = os.environ.copy()
+    env["HOME"] = env.get("HOME") or output_dir
+
+    try:
+        result = subprocess.run(
+            [
+                SOFFICE_BIN, "--headless", "--norestore", "--nologo", "--nofirststartwizard",
+                f"-env:UserInstallation={profile_uri}",
+                "--convert-to", "pdf", "--outdir", output_dir, input_path,
+            ],
+            timeout=timeout, capture_output=True, env=env, check=True,
+        )
+        out = (result.stdout or b"").decode(errors="replace").strip()
+        err = (result.stderr or b"").decode(errors="replace").strip()
+        if out:
+            logger.info(f"[soffice stdout] {out}")
+        if err:
+            logger.warning(f"[soffice stderr] {err}")
+    except subprocess.CalledProcessError as e:
+        out = (e.stdout or b"").decode(errors="replace").strip()
+        err = (e.stderr or b"").decode(errors="replace").strip()
+        logger.warning(
+            f"LibreOffice konvertatsiyasi muvaffaqiyatsiz (exit code {e.returncode}). "
+            f"stdout: {out!r} | stderr: {err!r}"
+        )
+        return None
+    except Exception as e:
+        logger.warning(f"LibreOffice konvertatsiyasi muvaffaqiyatsiz: {e}")
+        return None
+
+    expected = os.path.join(output_dir, os.path.splitext(os.path.basename(input_path))[0] + ".pdf")
+    if os.path.exists(expected):
+        return expected
+    try:
+        found = os.listdir(output_dir)
+    except Exception:
+        found = []
+    logger.warning(f"LibreOffice tugadi, lekin kutilgan fayl topilmadi: {expected} | papkada: {found}")
+    return None
+
+
 def do_document_to_pdf(chat_id: int, file_bytes: bytes, original_name: str):
     ext = os.path.splitext(original_name)[1].lower()
-    reader = DOCUMENT_READERS.get(ext)
-    if reader is None:
+    if ext not in DOCUMENT_READERS:
         bot.send_message(chat_id, "❗ Qo'llab-quvvatlanmaydigan fayl turi.")
         return
 
-    tmp_path = os.path.join(BASE_DIR, f"tmp_doc_{chat_id}_{int(time.time())}{ext}")
+    work_dir = os.path.join(BASE_DIR, f"tmp_doc_{chat_id}_{int(time.time())}")
+    os.makedirs(work_dir, exist_ok=True)
+    input_path = os.path.join(work_dir, f"input{ext}")
+    base_name = sanitize_filename(os.path.splitext(original_name)[0])
+
     try:
-        with open(tmp_path, "wb") as f:
+        with open(input_path, "wb") as f:
             f.write(file_bytes)
 
-        text = reader(tmp_path)
+        # 1) ENG YAXSHI USUL: LibreOffice — asl fayldagidek shrift/jadval/ustun/rasm bilan
+        pdf_path = convert_via_libreoffice(input_path, work_dir)
+        if pdf_path:
+            size_kb = os.path.getsize(pdf_path) / 1024
+            with open(pdf_path, "rb") as f:
+                buf = BytesIO(f.read())
+            buf.name = f"{base_name}.pdf"
+            send_with_retry(
+                bot.send_document, chat_id, buf,
+                caption=f"📑 PDF tayyor ({size_kb:.0f} KB)",
+            )
+            return
+
+        # 2) ZAXIRA USUL: LibreOffice mavjud bo'lmasa — oddiy matnli PDF
+        reader = DOCUMENT_READERS[ext]
+        text = reader(input_path)
         if not text.strip():
             bot.send_message(chat_id, "❗ Fayl ichida matn topilmadi.")
             return
 
         paragraphs = text.split("\n")
         pdf_bytes = generate_text_pdf(paragraphs)
-
-        base_name = sanitize_filename(os.path.splitext(original_name)[0])
         buf = BytesIO(pdf_bytes)
         buf.name = f"{base_name}.pdf"
         size_kb = len(pdf_bytes) / 1024
         send_with_retry(
             bot.send_document, chat_id, buf,
-            caption=f"📑 PDF tayyor ({size_kb:.0f} KB)",
+            caption=f"📑 PDF tayyor ({size_kb:.0f} KB) — soddalashtirilgan rejim",
         )
     except Exception as e:
         logger.exception("Hujjatni PDF qilishda xato")
         bot.send_message(chat_id, f"❌ Xatolik: {e}")
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ============================================================
-# HUJJAT (.docx / .xlsx / .pptx) QABUL QILISH
+# PDF -> WORD
+# - Agar PDF "raqamli" (Word/LibreOffice'dan yaratilgan, ichida haqiqiy matn
+#   bor) bo'lsa: pdf2docx bilan TO'G'RIDAN-TO'G'RI, OCR ISHLATMASDAN
+#   aylantiramiz — shuning uchun hech qanday so'z noto'g'ri o'qilmaydi.
+# - Faqat chindan SKANERLANGAN (rasm) PDF bo'lsagina, OCR (Tesseract,
+#   o'zbek+rus+ingliz) ishga tushadi. Bu holatda murakkab formulalar yoki
+#   rasmlar OCR'ning tabiiy cheklovi tufayli 100% aniq chiqmasligi mumkin —
+#   bu haqda foydalanuvchiga alohida ogohlantirish beriladi.
+# ============================================================
+TESSERACT_BIN = shutil.which("tesseract")
+
+
+def is_text_based_pdf(path: str, min_chars_per_page: int = 15) -> bool:
+    try:
+        doc = fitz.open(path)
+        page_count = len(doc)
+        if page_count == 0:
+            doc.close()
+            return True
+        total_chars = sum(len(page.get_text().strip()) for page in doc)
+        doc.close()
+        return (total_chars / page_count) >= min_chars_per_page
+    except Exception as e:
+        logger.warning(f"PDF matn tekshiruvida xato: {e}")
+        return True  # noaniq holatda "raqamli" deb hisoblab, OCR'ga urinmaymiz
+
+
+def convert_pdf_to_docx_digital(pdf_path: str, docx_path: str):
+    cv = Pdf2DocxConverter(pdf_path)
+    try:
+        cv.convert(docx_path)
+    finally:
+        cv.close()
+
+
+def convert_pdf_to_docx_ocr(pdf_path: str, docx_path: str):
+    doc = fitz.open(pdf_path)
+    out = DocxDocument()
+    try:
+        for i, page in enumerate(doc):
+            if i > 0:
+                out.add_page_break()
+            pix = page.get_pixmap(dpi=200)
+            img = Image.open(BytesIO(pix.tobytes("png")))
+            text = pytesseract.image_to_string(img, lang="uzb+rus+eng")
+            for line in text.split("\n"):
+                if line.strip():
+                    out.add_paragraph(line.strip())
+    finally:
+        doc.close()
+    out.save(docx_path)
+
+
+def do_pdf_to_word(chat_id: int, file_bytes: bytes, original_name: str):
+    work_dir = os.path.join(BASE_DIR, f"tmp_pdf2word_{chat_id}_{int(time.time())}")
+    os.makedirs(work_dir, exist_ok=True)
+    pdf_path = os.path.join(work_dir, "input.pdf")
+    docx_path = os.path.join(work_dir, "output.docx")
+    base_name = sanitize_filename(os.path.splitext(original_name)[0])
+
+    try:
+        with open(pdf_path, "wb") as f:
+            f.write(file_bytes)
+
+        note = ""
+        if is_text_based_pdf(pdf_path):
+            convert_pdf_to_docx_digital(pdf_path, docx_path)
+        else:
+            if not TESSERACT_BIN:
+                bot.send_message(
+                    chat_id,
+                    "❗ Bu skanerlangan (rasm) PDF ko'rinadi, uni o'qish uchun OCR "
+                    "kerak, lekin serverda OCR o'rnatilmagan. Administratorga xabar bering.",
+                )
+                return
+            convert_pdf_to_docx_ocr(pdf_path, docx_path)
+            note = (
+                " ⚠️ Bu skanerlangan hujjat bo'lgani uchun OCR orqali o'qildi — "
+                "murakkab formulalar yoki rasmlar to'liq aniq chiqmasligi mumkin."
+            )
+
+        if not os.path.exists(docx_path) or os.path.getsize(docx_path) < 1024:
+            bot.send_message(
+                chat_id,
+                "❌ PDF'ni Word'ga aylantirib bo'lmadi (natija bo'sh chiqdi). "
+                "Bu PDF juda murakkab yoki katta bo'lishi mumkin. Boshqa faylni sinab ko'ring.",
+            )
+            return
+
+        with open(docx_path, "rb") as f:
+            buf = BytesIO(f.read())
+        buf.name = f"{base_name}.docx"
+        send_with_retry(bot.send_document, chat_id, buf, caption=f"📝 Word tayyor.{note}")
+    except Exception as e:
+        logger.exception("PDF'ni Word'ga aylantirishda xato")
+        bot.send_message(chat_id, f"❌ Xatolik: {e}")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ============================================================
+# HUJJAT (.docx / .xlsx / .pptx / .pdf) QABUL QILISH
 # ============================================================
 @bot.message_handler(content_types=["document"])
 def handle_document(message: types.Message):
@@ -930,6 +1209,17 @@ def handle_document(message: types.Message):
     name = doc.file_name or ""
     ext = os.path.splitext(name)[1].lower()
     settings = get_settings(message.from_user.id)
+
+    if settings.get("mode") == "awaiting_pdf_for_word":
+        if ext != ".pdf":
+            bot.reply_to(message, "❗ Faqat .pdf fayl qabul qilinadi.")
+            return
+        settings["mode"] = None
+        file_info = bot.get_file(doc.file_id)
+        file_bytes = bot.download_file(file_info.file_path)
+        bot.send_message(message.chat.id, "✍️ Word tayyorlanmoqda...", reply_markup=main_menu_keyboard(message.from_user.id))
+        enqueue_job(message.chat.id, do_pdf_to_word, message.chat.id, file_bytes, name)
+        return
 
     if settings.get("mode") == "awaiting_document_for_pdf":
         if ext not in DOCUMENT_READERS:
@@ -1159,6 +1449,9 @@ def handle_text(message: types.Message):
         return
     if settings.get("mode") == "awaiting_document_for_pdf":
         bot.send_message(message.chat.id, "📝 Iltimos, .docx, .xlsx yoki .pptx faylni yuboring.")
+        return
+    if settings.get("mode") == "awaiting_pdf_for_word":
+        bot.send_message(message.chat.id, "📄 Iltimos, .pdf faylni yuboring.")
         return
     if blocked_by_subscription(message):
         return
